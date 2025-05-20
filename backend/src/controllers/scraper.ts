@@ -54,9 +54,7 @@ Request, res: Response, next: NextFunction)
     }
     
     // Ensure the URL has a protocol
-    if (!config.url.startsWith('http')) { 
-      config.url = `https://${config.url}`;
-    }
+    config.url = _ensureUrlProtocol(config.url);
     
     // Create browser manager
     const browserManager = new 
@@ -284,457 +282,368 @@ Request, res: Response, next: NextFunction)
     next(error);
   }
 };
+// Define types for callbacks
+type ExtractPageDataCallback<T> = (
+  pageContext: T,
+  config: any,
+  job: any,
+  currentUrl: string,
+  pageNum: number
+) => Promise<boolean>; // Returns true if test run limit reached
+
+type GetNextPageCallback<T> = (
+  pageContext: T,
+  config: any,
+  currentUrl: string
+) => Promise<string | null>;
+
+// Generic function for paginated scraping
+async function _processPaginatedScraping<T>(
+  jobId: string,
+  config: any,
+  job: any,
+  initialPageContext: T,
+  extractPageDataCallback: ExtractPageDataCallback<T>,
+  getNextPageCallback: GetNextPageCallback<T>,
+  preparePageCallback?: (page: puppeteer.Page, currentUrl: string) => Promise<void>
+) {
+  let currentUrl = config.url;
+  let pageNum = 1;
+  let hasMorePages = true;
+  let pageContext = initialPageContext;
+
+  while (hasMorePages && !job.isCancelled) {
+    if (pageNum > 1 && config.requestDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, config.requestDelay));
+    }
+
+    job.logs.push(`Processing page ${pageNum}: ${currentUrl}`);
+
+    if (preparePageCallback && pageContext) {
+      await preparePageCallback(pageContext as unknown as puppeteer.Page, currentUrl);
+    }
+    
+    const testRunLimitReached = await extractPageDataCallback(
+      pageContext,
+      config,
+      job,
+      currentUrl,
+      pageNum
+    );
+
+    if (testRunLimitReached) {
+      hasMorePages = false;
+      job.logs.push('Test run completed, stopping after 5 results');
+      // No break here, loop condition will handle it
+    }
+
+    if (config.enablePagination && hasMorePages && !job.isCancelled) {
+      const nextPageUrl = await getNextPageCallback(pageContext, config, currentUrl);
+      if (nextPageUrl && nextPageUrl !== currentUrl) {
+        currentUrl = nextPageUrl;
+        pageNum++;
+      } else {
+        hasMorePages = false;
+        if (!job.isCancelled) job.logs.push('No more pages found or page URL did not change.');
+      }
+    } else {
+      hasMorePages = false;
+    }
+  }
+}
+
+// --- Refactored Extraction Functions ---
+
 // Extract data using CSS selectors
-async function extractWithCssSelector(jobId: 
-string, config: any) {
-  const job = activeJobs.get(jobId); if 
-  (!job) return;
-  
-  if (!config.cssSelector) { 
-    job.logs.push('CSS selector is 
-    required'); throw new Error('CSS selector 
-    is required');
+async function extractWithCssSelector(jobId: string, config: any) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+
+  if (!config.cssSelector) {
+    job.logs.push('CSS selector is required');
+    throw new Error('CSS selector is required');
   }
-  
-  job.logs.push(`Extracting data with CSS 
-  selector: ${config.cssSelector}`);
-  
-  let currentUrl = config.url; let pageNum = 
-  1; let hasMorePages = true;
-  
-  while (hasMorePages && !job.isCancelled) {
-    // Delay between requests if specified
-    if (pageNum > 1 && config.requestDelay > 
-    0) {
-      await new Promise(resolve => 
-      setTimeout(resolve, 
-      config.requestDelay));
-    }
-    
-    job.logs.push(`Processing page 
-    ${pageNum}: ${currentUrl}`);
-    
-    // Get the page content
-    const response = await 
-    axios.get(currentUrl, {
-      headers: { 'User-Agent': 
-        config.userAgent,
-      },
+  job.logs.push(`Extracting data with CSS selector: ${config.cssSelector}`);
+
+  const extractPageData: ExtractPageDataCallback<cheerio.CheerioAPI | null> = async (
+    $, // CheerioAPI will be passed here after fetching
+    cfg,
+    j,
+    url,
+    pn
+  ) => {
+    // This callback now receives currentUrl and pageNum from the main loop
+    // It needs to fetch the page content itself for Cheerio
+    const response = await axios.get(url, {
+      headers: { 'User-Agent': cfg.userAgent },
     });
-    
-    const html = response.data; const $ = 
-    cheerio.load(html);
-    
-    // Extract data with CSS selector
-    const elements = $(config.cssSelector); 
-    job.logs.push(`Found ${elements.length} 
-    elements matching the selector`);
-    
-    elements.each((i, el) => { const element 
-      = $(el); const text = 
-      element.text().trim(); const html = 
-      element.html() || ''; const href = 
-      element.attr('href') || '';
-      
-      const data = { text, html, href,
-        // Add other attributes as needed
-        url: currentUrl, pageNum,
-      };
-      
-      job.results.push(data);
-      
-      // If this is a test run, limit to 5 
-      // results
-      if (config.testRun && 
-      job.results.length >= 5) {
-        hasMorePages = false; 
-        job.logs.push('Test run completed, 
-        stopping after 5 results'); return 
-        false; // Break the each loop
+    const html = response.data;
+    const loadedCheerio = cheerio.load(html);
+
+    const elements = loadedCheerio(cfg.cssSelector);
+    j.logs.push(`Found ${elements.length} elements matching the selector`);
+    let limitReached = false;
+    elements.each((_, el) => {
+      const element = loadedCheerio(el);
+      const text = element.text().trim();
+      const htmlContent = element.html() || '';
+      const href = element.attr('href') || '';
+      const data = { text, html: htmlContent, href, url, pageNum: pn };
+      j.results.push(data);
+      if (cfg.testRun && j.results.length >= 5) {
+        limitReached = true;
+        return false; // Break Cheerio's .each loop
       }
     });
-    
-    // Handle pagination if enabled
-    if (config.enablePagination && 
-    hasMorePages) {
-      const nextPageUrl = getNextPageUrl($, 
-      currentUrl, config); if (nextPageUrl && 
-      nextPageUrl !== currentUrl) {
-        currentUrl = nextPageUrl; pageNum++;
-      } else {
-        hasMorePages = false; 
-        job.logs.push('No more pages found');
-      }
-    } else {
-      hasMorePages = false;
-    }
-  }
+    return limitReached; // Return whether the test run limit was reached
+  };
+
+  const getNextPage: GetNextPageCallback<cheerio.CheerioAPI | null> = async (
+    $, // CheerioAPI is not directly used here, but passed for consistency
+    cfg,
+    url
+  ) => {
+    // To use getNextPageUrl, we need to fetch the content and pass the Cheerio object
+    // This is somewhat inefficient as we might fetch the page twice if extractPageData also fetches.
+    // However, getNextPageUrl expects a CheerioAPI object.
+    // For CSS selector, the $ object for getNextPageUrl should be from the current page's content.
+    // The `_processPaginatedScraping` won't have the Cheerio $ object for the current page
+    // unless `extractPageData` returns it or we fetch it again.
+    // Let's assume extractPageData will be modified or this callback will handle fetching if needed.
+    // For now, we'll fetch again, which is not ideal.
+    // A better refactor might involve `extractPageData` returning the Cheerio object.
+    // Or, `_processPaginatedScraping` could handle the fetching for Cheerio.
+
+    // Re-fetch page content to get a Cheerio object for `getNextPageUrl`.
+    // This is because the initialPageContext for Cheerio is null.
+    const response = await axios.get(url, { headers: { 'User-Agent': cfg.userAgent } });
+    const html = response.data;
+    const currentCheerioPage = cheerio.load(html);
+    return getNextPageUrl(currentCheerioPage, url, cfg);
+  };
+  
+  // Initial pageContext for Cheerio is null, it will fetch inside extractPageData
+  await _processPaginatedScraping(jobId, config, job, null, extractPageData, getNextPage);
 }
+
 // Extract data using XPath
-async function extractWithXPath(jobId: 
-string, config: any) {
-  const job = activeJobs.get(jobId); if 
-  (!job) return;
-  
-  if (!config.xpathExpression) { 
-    job.logs.push('XPath expression is 
-    required'); throw new Error('XPath 
-    expression is required');
+async function extractWithXPath(jobId: string, config: any) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+
+  if (!config.xpathExpression) {
+    job.logs.push('XPath expression is required');
+    throw new Error('XPath expression is required');
   }
-  
-  job.logs.push(`Extracting data with XPath: 
-  ${config.xpathExpression}`);
-  
-  // For XPath, we need to use Puppeteer
-  await job.browser.initialize(); const page 
-  = await job.browser.getPage();
-  
-  let currentUrl = config.url; let pageNum = 
-  1; let hasMorePages = true;
-  
-  while (hasMorePages && !job.isCancelled) {
-    // Delay between requests if specified
-    if (pageNum > 1 && config.requestDelay > 
-    0) {
-      await new Promise(resolve => 
-      setTimeout(resolve, 
-      config.requestDelay));
-    }
-    
-    job.logs.push(`Processing page 
-    ${pageNum}: ${currentUrl}`);
-    
-    // Navigate to the page
-    await page.goto(currentUrl, { waitUntil: 
-    'networkidle2' });
-    
-    // Extract elements using XPath
-    const elements = await 
-    page.$x(config.xpathExpression); 
-    job.logs.push(`Found ${elements.length} 
-    elements matching the XPath expression`);
-    
-    for (const element of elements) { const 
-      textContent = await page.evaluate(el => 
-      el.textContent.trim(), element); const 
-      innerHTML = await page.evaluate(el => 
-      el.innerHTML, element); const href = 
-      await page.evaluate(el => 
-      el.getAttribute('href') || '', 
-      element);
-      
-      const data = { text: textContent, html: 
-        innerHTML, href, url: currentUrl, 
-        pageNum,
-      };
-      
-      job.results.push(data);
-      
-      // If this is a test run, limit to 5 
-      // results
-      if (config.testRun && 
-      job.results.length >= 5) {
-        hasMorePages = false; 
-        job.logs.push('Test run completed, 
-        stopping after 5 results'); break;
+  job.logs.push(`Extracting data with XPath: ${config.xpathExpression}`);
+
+  await job.browser.initialize();
+  const page = await job.browser.getPage();
+
+  const extractPageData: ExtractPageDataCallback<puppeteer.Page> = async (
+    p, // Puppeteer page
+    cfg,
+    j,
+    url, // current URL passed by the loop
+    pn
+  ) => {
+    const elements = await p.$x(cfg.xpathExpression);
+    j.logs.push(`Found ${elements.length} elements matching the XPath expression`);
+    let limitReached = false;
+    for (const element of elements) {
+      const textContent = await p.evaluate(el => el.textContent?.trim(), element);
+      const innerHTML = await p.evaluate(el => el.innerHTML, element);
+      const href = await p.evaluate(el => el.getAttribute('href') || '', element);
+      const data = { text: textContent, html: innerHTML, href, url, pageNum: pn };
+      j.results.push(data);
+      if (cfg.testRun && j.results.length >= 5) {
+        limitReached = true;
+        break; 
       }
     }
-    
-    // Handle pagination if enabled
-    if (config.enablePagination && 
-    hasMorePages) {
-      const nextPageButton = await 
-      findNextPageButton(page, config); if 
-      (nextPageButton) {
-        await nextPageButton.click(); await 
-        page.waitForNavigation({ waitUntil: 
-        'networkidle2' }); currentUrl = 
-        page.url(); pageNum++;
-      } else {
-        hasMorePages = false; 
-        job.logs.push('No more pages found');
-      }
-    } else {
-      hasMorePages = false;
+    return limitReached;
+  };
+
+  const getNextPage: GetNextPageCallback<puppeteer.Page> = async (
+    p, 
+    cfg,
+    _currentUrl // page.url() will be the source of truth
+    ) => {
+    const nextPageButton = await findNextPageButton(p, cfg);
+    if (nextPageButton) {
+      await nextPageButton.click();
+      await p.waitForNavigation({ waitUntil: 'networkidle2' });
+      return p.url();
     }
-  }
+    return null;
+  };
+  
+  const preparePage: (page: puppeteer.Page, currentUrl: string) => Promise<void> = async (p, url) => {
+    await p.goto(url, { waitUntil: 'networkidle2' });
+  };
+
+  await _processPaginatedScraping(jobId, config, job, page, extractPageData, getNextPage, preparePage);
 }
+
 // Extract data using Visual Selectors
-async function 
-extractWithVisualSelector(jobId: string, 
-config: any) {
-  const job = activeJobs.get(jobId); if 
-  (!job) return;
-  
-  if (!config.visualSelections || 
-  config.visualSelections.length === 0) {
-    job.logs.push('Visual selections are 
-    required'); throw new Error('Visual 
-    selections are required');
+async function extractWithVisualSelector(jobId: string, config: any) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+
+  if (!config.visualSelections || config.visualSelections.length === 0) {
+    job.logs.push('Visual selections are required');
+    throw new Error('Visual selections are required');
   }
-  
-  job.logs.push(`Extracting data with 
-  ${config.visualSelections.length} visual 
-  selectors`);
-  
-  await job.browser.initialize(); const page 
-  = await job.browser.getPage();
-  
-  let currentUrl = config.url; let pageNum = 
-  1; let hasMorePages = true;
-  
-  while (hasMorePages && !job.isCancelled) {
-    // Delay between requests if specified
-    if (pageNum > 1 && config.requestDelay > 
-    0) {
-      await new Promise(resolve => 
-      setTimeout(resolve, 
-      config.requestDelay));
+  job.logs.push(`Extracting data with ${config.visualSelections.length} visual selectors`);
+
+  await job.browser.initialize();
+  const page = await job.browser.getPage();
+
+  const extractPageData: ExtractPageDataCallback<puppeteer.Page> = async (
+    p, cfg, j, url, pn
+  ) => {
+    if (cfg.enableInfiniteScroll) {
+      await handleInfiniteScroll(p, cfg, j);
     }
-    
-    job.logs.push(`Processing page 
-    ${pageNum}: ${currentUrl}`);
-    
-    // Navigate to the page
-    await page.goto(currentUrl, { waitUntil: 
-    'networkidle2' });
-    
-    // If infinite scrolling is enabled, 
-    // scroll to load all content
-    if (config.enableInfiniteScroll) { await 
-      handleInfiniteScroll(page, config, 
-      job);
-    }
-    
-    // Get the container selector if 
-    // available
-    const containerSelector = 
-    config.visualSelections.find((s: any) => 
-    s.label === 'container')?.selector;
-    
+    const containerSelector = cfg.visualSelections.find((s: any) => s.label === 'container')?.selector;
+    let limitReached = false;
+
     if (containerSelector) {
-      // If we have a container, each 
-      // container represents one item
-      const containers = await 
-      page.$$(containerSelector); 
-      job.logs.push(`Found 
-      ${containers.length} containers 
-      matching the selector`);
-      
-      for (const container of containers) { 
+      const containers = await p.$$(containerSelector);
+      j.logs.push(`Found ${containers.length} containers matching the selector`);
+      for (const container of containers) {
         const item: Record<string, any> = {};
-        
-        // Extract data from each field 
-        // selector within the container 
-        // context
-        for (const selection of 
-        config.visualSelections) {
-          if (selection.label !== 
-          'container') {
-            try { const fieldElement = await 
-              container.$(selection.selector); 
+        for (const selection of cfg.visualSelections) {
+          if (selection.label !== 'container') {
+            try {
+              const fieldElement = await container.$(selection.selector);
               if (fieldElement) {
-                const text = await 
-                page.evaluate(el => 
-                el.textContent.trim(), 
-                fieldElement); const href = 
-                await page.evaluate(el => 
-                el.getAttribute('href') || 
-                '', fieldElement);
-                
-                item[selection.label] = text; 
+                const text = await p.evaluate(el => el.textContent?.trim(), fieldElement);
+                const href = await p.evaluate(el => el.getAttribute('href') || '', fieldElement);
+                item[selection.label] = text;
                 if (href) {
-                  item[`${selection.label}_url`] 
-                  = href.startsWith('http') ? 
-                  href : new URL(href, 
-                  page.url()).href;
+                  item[`${selection.label}_url`] = href.startsWith('http') ? href : new URL(href, p.url()).href;
                 }
               }
             } catch (error) {
-              job.logs.push(`Error extracting 
-              field ${selection.label}: 
-              ${error instanceof Error ? 
-              error.message : 
-              String(error)}`);
+              j.logs.push(`Error extracting field ${selection.label}: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
         }
-        
-        // Add the item if it has at least 
-        // one property
-        if (Object.keys(item).length > 0) { 
-          item.url = page.url(); 
-          job.results.push(item);
-          
-          // If this is a test run, limit to 
-          // 5 results
-          if (config.testRun && 
-          job.results.length >= 5) {
-            hasMorePages = false; 
-            job.logs.push('Test run 
-            completed, stopping after 5 
-            results'); break;
+        if (Object.keys(item).length > 0) {
+          item.url = p.url(); // Use current page URL from Puppeteer
+          j.results.push(item);
+          if (cfg.testRun && j.results.length >= 5) {
+            limitReached = true;
+            break;
           }
         }
       }
     } else {
-      // No container, so we have individual 
-      // selectors
-      const item: Record<string, any> = { 
-      url: page.url() };
-      
-      for (const selection of 
-      config.visualSelections) {
-        try { const elements = await 
-          page.$$(selection.selector); if 
-          (elements.length === 1) {
-            // Single element
-            const text = await 
-            page.evaluate(el => 
-            el.textContent.trim(), 
-            elements[0]); const href = await 
-            page.evaluate(el => 
-            el.getAttribute('href') || '', 
-            elements[0]);
-            
-            item[selection.label] = text; if 
-            (href) {
-              item[`${selection.label}_url`] 
-              = href.startsWith('http') ? 
-              href : new URL(href, 
-              page.url()).href;
+      const item: Record<string, any> = { url: p.url() };
+      for (const selection of cfg.visualSelections) {
+        try {
+          const elements = await p.$$(selection.selector);
+          if (elements.length === 1) {
+            const text = await p.evaluate(el => el.textContent?.trim(), elements[0]);
+            const href = await p.evaluate(el => el.getAttribute('href') || '', elements[0]);
+            item[selection.label] = text;
+            if (href) {
+              item[`${selection.label}_url`] = href.startsWith('http') ? href : new URL(href, p.url()).href;
             }
           } else if (elements.length > 1) {
-            // Multiple elements, collect as 
-            // array
-            const values = await 
-            Promise.all(elements.map(async 
-            (el) => {
-              const text = await 
-              page.evaluate(el => 
-              el.textContent.trim(), el); 
-              return text;
+            const values = await Promise.all(elements.map(async (el) => {
+              return await p.evaluate(el => el.textContent?.trim(), el);
             }));
             item[selection.label] = values;
           }
         } catch (error) {
-          job.logs.push(`Error extracting 
-          field ${selection.label}: ${error 
-          instanceof Error ? error.message : 
-          String(error)}`);
+          j.logs.push(`Error extracting field ${selection.label}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      
-      // Add the item if it has at least one 
-      // property besides url
-      if (Object.keys(item).length > 1) { 
-        job.results.push(item);
+      if (Object.keys(item).length > 1) {
+        j.results.push(item);
+        // Note: Test run limit for non-container visual selection would apply after all selections are processed for the page.
+        // This specific check might need to be outside if we want to stop immediately after 5 items even if they come from one page.
+        // For now, it will stop after the current page's items are added if the limit is reached.
+        if (cfg.testRun && j.results.length >= 5) {
+          limitReached = true; 
+        }
       }
     }
-    
-    // Handle pagination if enabled
-    if (config.enablePagination && 
-    hasMorePages) {
-      const nextPageButton = await 
-      findNextPageButton(page, config); if 
-      (nextPageButton) {
-        await nextPageButton.click(); await 
-        page.waitForNavigation({ waitUntil: 
-        'networkidle2' }); currentUrl = 
-        page.url(); pageNum++;
-      } else {
-        hasMorePages = false; 
-        job.logs.push('No more pages found');
-      }
-    } else {
-      hasMorePages = false;
+    return limitReached;
+  };
+
+  const getNextPage: GetNextPageCallback<puppeteer.Page> = async (p, cfg, _currentUrl) => {
+    const nextPageButton = await findNextPageButton(p, cfg);
+    if (nextPageButton) {
+      await nextPageButton.click();
+      await p.waitForNavigation({ waitUntil: 'networkidle2' });
+      return p.url();
     }
-  }
+    return null;
+  };
+  
+  const preparePage: (page: puppeteer.Page, currentUrl: string) => Promise<void> = async (p, url) => {
+    await p.goto(url, { waitUntil: 'networkidle2' });
+  };
+
+  await _processPaginatedScraping(jobId, config, job, page, extractPageData, getNextPage, preparePage);
 }
+
 // Extract data using AI Description
-async function 
-extractWithAiDescription(jobId: string, 
-config: any) {
-  const job = activeJobs.get(jobId); if 
-  (!job) return;
-  
-  if (!config.aiDescription) { 
-    job.logs.push('AI description is 
-    required'); throw new Error('AI 
-    description is required');
+async function extractWithAiDescription(jobId: string, config: any) {
+  const job = activeJobs.get(jobId);
+  if (!job) return;
+
+  if (!config.aiDescription) {
+    job.logs.push('AI description is required');
+    throw new Error('AI description is required');
   }
-  
-  job.logs.push(`Extracting data with AI 
-  description: "${config.aiDescription}"`);
-  
-  await job.browser.initialize(); const page 
-  = await job.browser.getPage();
-  
-  let currentUrl = config.url; let pageNum = 
-  1; let hasMorePages = true;
-  
-  while (hasMorePages && !job.isCancelled) {
-    // Delay between requests if specified
-    if (pageNum > 1 && config.requestDelay > 
-    0) {
-      await new Promise(resolve => 
-      setTimeout(resolve, 
-      config.requestDelay));
+  job.logs.push(`Extracting data with AI description: "${config.aiDescription}"`);
+
+  await job.browser.initialize();
+  const page = await job.browser.getPage();
+
+  const extractPageData: ExtractPageDataCallback<puppeteer.Page> = async (
+    p, cfg, j, _url, _pn // url and pn not directly used here as items contain it or it's from p.url()
+  ) => {
+    if (cfg.enableInfiniteScroll) {
+      await handleInfiniteScroll(p, cfg, j);
     }
+    const items = await extractWithNaturalLanguage(p, cfg.aiDescription);
+    j.logs.push(`Extracted ${items.length} items from page ${_pn}`); // Use pn for log
     
-    job.logs.push(`Processing page 
-    ${pageNum}: ${currentUrl}`);
-    
-    // Navigate to the page
-    await page.goto(currentUrl, { waitUntil: 
-    'networkidle2' });
-    
-    // If infinite scrolling is enabled, 
-    // scroll to load all content
-    if (config.enableInfiniteScroll) { await 
-      handleInfiniteScroll(page, config, 
-      job);
+    let limitReached = false;
+    for (const item of items) { // Ensure each item from AI has pageNum and currentUrl if not already set by extractWithNaturalLanguage
+        if (!item.url) item.url = p.url();
+        // pageNum is not explicitly added to AI items here, might need adjustment if required per item
+        j.results.push(item);
+        if (cfg.testRun && j.results.length >=5) {
+            limitReached = true;
+            break;
+        }
     }
-    
-    // Use AI-based data extraction 
-    // (simplified implementation)
-    const items = await 
-    extractWithNaturalLanguage(page, 
-    config.aiDescription); 
-    job.logs.push(`Extracted ${items.length} 
-    items from page ${pageNum}`);
-    
-    // Add items to results
-    job.results.push(...items);
-    
-    // If this is a test run, limit to 5 
-    // results
-    if (config.testRun && job.results.length 
-    >= 5) {
-      hasMorePages = false; 
-      job.logs.push('Test run completed, 
-      stopping after 5 results'); break;
+    return limitReached;
+  };
+
+  const getNextPage: GetNextPageCallback<puppeteer.Page> = async (p, cfg, _currentUrl) => {
+    const nextPageButton = await findNextPageButton(p, cfg);
+    if (nextPageButton) {
+      await nextPageButton.click();
+      await p.waitForNavigation({ waitUntil: 'networkidle2' });
+      return p.url();
     }
-    
-    // Handle pagination if enabled
-    if (config.enablePagination && 
-    hasMorePages) {
-      const nextPageButton = await 
-      findNextPageButton(page, config); if 
-      (nextPageButton) {
-        await nextPageButton.click(); await 
-        page.waitForNavigation({ waitUntil: 
-        'networkidle2' }); currentUrl = 
-        page.url(); pageNum++;
-      } else {
-        hasMorePages = false; 
-        job.logs.push('No more pages found');
-      }
-    } else {
-      hasMorePages = false;
-    }
-  }
+    return null;
+  };
+
+  const preparePage: (page: puppeteer.Page, currentUrl: string) => Promise<void> = async (p, url) => {
+    await p.goto(url, { waitUntil: 'networkidle2' });
+  };
+
+  await _processPaginatedScraping(jobId, config, job, page, extractPageData, getNextPage, preparePage);
 }
+
 // Helper function to extract data using 
 // natural language description
 async function 
@@ -1123,6 +1032,14 @@ export const cancelJob = async (req: Request, res: Response, next: NextFunction)
   }
 };
 
+// Helper function to ensure URL has a protocol
+function _ensureUrlProtocol(url: string): string {
+  if (!url.startsWith('http')) {
+    return `https://${url}`;
+  }
+  return url;
+}
+
 // Check robots.txt compliance for a URL
 export const checkRobotsTxt = async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -1133,7 +1050,7 @@ export const checkRobotsTxt = async (req: Request, res: Response, next: NextFunc
     }
     
     // Ensure the URL has a protocol
-    const formattedUrl = url.startsWith('http') ? url : `https://${url}`;
+    const formattedUrl = _ensureUrlProtocol(url);
     
     // Default user agent
     const userAgent = req.query.userAgent as string || 'WebScraper/1.0';
